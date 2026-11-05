@@ -1,0 +1,9 @@
+# GAOMON S620 (256c:006d): give the active local session read access to the
+# pad node only (the four express keys). The pen stays restricted to root and
+# keeps reaching Hyprland through libinput.
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_VENDOR_ID}=="256c", ENV{ID_MODEL_ID}=="006d", ATTRS{name}=="* Pad", TAG+="uaccess"
+
+# The same access for OpenTabletDriver's virtual pad, which carries the
+# express keys on the OTD backend. The virtual tablet and keyboard stay
+# restricted.
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="OpenTabletDriver Virtual Pad", TAG+="uaccess"

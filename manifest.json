@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "com.aeonarc.gaomon-s620",
+  "name": "GAOMON S620",
+  "version": "1.0.0",
+  "author": "Aeon Arc",
+  "license": "MIT",
+  "description": "Screen mapping, rotation, pressure range and express keys of the GAOMON S620 pen tablet in the Omarchy bar, on the kernel driver and without the vendor's driver.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "TabletPanel.qml"
+  },
+  "barWidget": {
+    "displayName": "GAOMON S620",
+    "description": "Pen tablet status; click for screen mapping, rotation, pressure and the four express keys. The express keys need the udev rule from the plugin's README.",
+    "category": "Devices",
+    "aliases": ["gaomon", "s620", "tablet", "pen tablet", "drawing tablet"],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

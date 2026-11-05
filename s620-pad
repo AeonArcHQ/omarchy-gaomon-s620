@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+"""Express key reader and backend helper for the GAOMON S620 pen tablet (256c:006d).
+
+The kernel's hid-uclogic driver already switches the tablet into its full
+mode and splits it into "Pen", "Pad", "Touch Strip" and "Dial" input nodes;
+see docs/re/findings.md. Hyprland takes the pen through libinput, but nothing
+on Wayland turns the pad's buttons into actions. On the kernel backend this
+helper reads the pad's evdev node (without grabbing it) and reports each
+button. It also reports which backend owns the tablet (GLOSSARY.md):
+"kernel" when the GAOMON input nodes exist, "otd" when the USB device is
+plugged in and only the OpenTabletDriver virtual tablet is there. On the
+OTD backend the express keys come from the "OpenTabletDriver Virtual Pad"
+node, which shows up once the plugin's pad bindings are applied; until then
+the backend reports as connected without keys.
+
+  s620-pad watch     one JSON object per line:
+                     {"ok": true, "event": "connected", "device": "/dev/input/event23",
+                      "firmware": "OEM02_T18e_200919", "backend": "kernel"}
+                     {"ok": true, "event": "connected", "backend": "otd"}
+                     {"ok": true, "event": "key", "code": 256, "pressed": true}
+                     {"ok": false, "error": <code>}  (access-denied also
+                      carries "backend" and "firmware": the tablet is there,
+                      only unreadable)
+  s620-pad save <profile-json>
+                     saves the profile to PROFILE_PATH: {"ok": true} or
+                     {"ok": false, "error": "invalid"}
+  s620-pad otd-read  prints the daemon's running settings (otd savesettings
+                     to a temp file, then the file's text)
+  s620-pad otd-apply <document>
+                     otd loadsettings the document, then otd savesettings to
+                     the persisted path; prints "ok"
+
+Model.js decides what each button does; this helper only moves events. The
+`otd` console client is found in PATH; S620_PAD_OTD overrides its path.
+
+Error codes: missing (no tablet), no-driver (the tablet is plugged in but
+neither the kernel driver nor OpenTabletDriver owns it), access-denied (no
+permission on the pad node; install the udev rule), invalid (bad arguments).
+"""
+
+from __future__ import annotations
+
+import errno
+import json
+import os
+import select
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Optional
+
+VENDOR = "256c"
+PRODUCT = "006d"
+PAD_SUFFIX = " Pad"
+KERNEL_SUFFIXES = (" Pen", PAD_SUFFIX)
+# struct input_event on 64-bit Linux: struct timeval, __u16 type, __u16 code,
+# __s32 value.
+EVENT = struct.Struct("llHHi")
+EV_KEY = 0x01
+PROFILE_PATH = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "gaomon-s620" / "profile.json"
+RETRY_SECONDS = 2.0
+SYSFS_INPUT = Path("/sys/class/input")
+SYSFS_USB = Path("/sys/bus/usb/devices")
+OTD = os.environ.get("S620_PAD_OTD", "otd")
+OTD_SETTINGS = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "OpenTabletDriver" / "settings.json"
+OTD_TABLET_NAME = "OpenTabletDriver Virtual Artist Tablet"
+OTD_PAD_NAME = "OpenTabletDriver Virtual Pad"
+
+
+def read_attr(path: Path) -> str:
+    try:
+        return path.read_text().strip()
+    except OSError:
+        return ""
+
+
+def find_device(root: Path = SYSFS_INPUT) -> Optional[str]:
+    for node in sorted(root.glob("event*"), key=lambda p: int(p.name[5:] or 0)):
+        device = node / "device"
+        if (read_attr(device / "id" / "vendor") == VENDOR
+                and read_attr(device / "id" / "product") == PRODUCT
+                and read_attr(device / "name").endswith(PAD_SUFFIX)):
+            return "/dev/input/" + node.name
+    return None
+
+
+def find_otd_pad(root: Path = SYSFS_INPUT) -> Optional[str]:
+    """The OpenTabletDriver virtual pad, created once a pad binding is in the
+    daemon's settings."""
+    for node in sorted(root.glob("event*"), key=lambda p: int(p.name[5:] or 0)):
+        if read_attr(node / "device" / "name") == OTD_PAD_NAME:
+            return "/dev/input/" + node.name
+    return None
+
+
+def read_firmware(device: str, root: Path = SYSFS_INPUT) -> str:
+    """The firmware version hid-uclogic puts in the node's uniq, "" if unreadable."""
+    return read_attr(root / Path(device).name / "device" / "uniq")
+
+
+def kernel_nodes(root: Path = SYSFS_INPUT) -> bool:
+    """Any input node hid-uclogic made for the tablet (256c:006d, "… Pen" or
+    "… Pad"). hid-generic's single unsuffixed node, made while the OTD package
+    blocks hid-uclogic, does not count."""
+    for node in root.glob("event*"):
+        device = node / "device"
+        if (read_attr(device / "id" / "vendor") == VENDOR
+                and read_attr(device / "id" / "product") == PRODUCT
+                and read_attr(device / "name").endswith(KERNEL_SUFFIXES)):
+            return True
+    return False
+
+
+def usb_plugged(root: Path = SYSFS_USB) -> bool:
+    """The tablet's USB device anywhere under /sys/bus/usb/devices."""
+    for vendor in root.glob("*/idVendor"):
+        if (read_attr(vendor) == VENDOR
+                and read_attr(vendor.parent / "idProduct") == PRODUCT):
+            return True
+    return False
+
+
+def otd_tablet(root: Path = SYSFS_INPUT) -> bool:
+    """The OpenTabletDriver virtual artist tablet among the input nodes."""
+    for node in root.glob("event*"):
+        if read_attr(node / "device" / "name") == OTD_TABLET_NAME:
+            return True
+    return False
+
+
+def detect_backend(input_root: Path = SYSFS_INPUT, usb_root: Path = SYSFS_USB) -> str:
+    """Who owns the tablet: kernel nodes win; a leftover OTD virtual tablet
+    without the USB device is not a tablet."""
+    if kernel_nodes(input_root):
+        return "kernel"
+    if not usb_plugged(usb_root):
+        return "missing"
+    if otd_tablet(input_root):
+        return "otd"
+    return "no-driver"
+
+
+def otd_read(otd: str = OTD, env: Optional[dict] = None) -> str:
+    """The daemon's running settings, always fresh (a stale file once reset
+    a rotation; docs/re/opentabletdriver.md)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        target = Path(tmp) / "settings.json"
+        subprocess.run([otd, "savesettings", str(target)], check=True, env=env)
+        return target.read_text()
+
+
+def otd_apply(document: dict, otd: str = OTD,
+              settings_path: Path = OTD_SETTINGS, env: Optional[dict] = None) -> None:
+    """loadsettings the document, then persist the running settings."""
+    if not isinstance(document, dict):
+        raise ValueError("settings document is not a JSON object")
+    with tempfile.TemporaryDirectory() as tmp:
+        target = Path(tmp) / "settings.json"
+        target.write_text(json.dumps(document))
+        subprocess.run([otd, "loadsettings", str(target)], check=True, env=env)
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run([otd, "savesettings", str(settings_path)], check=True, env=env)
+
+
+def decode(data: bytes) -> list:
+    """Key events in a read from the evdev node; other event types are dropped."""
+    events = []
+    for offset in range(0, len(data) - EVENT.size + 1, EVENT.size):
+        _, _, kind, code, value = EVENT.unpack_from(data, offset)
+        # value 2 is autorepeat; the pad does not send it, and a repeat would
+        # press the shortcut again.
+        if kind == EV_KEY and value in (0, 1):
+            events.append({"event": "key", "code": code, "pressed": value == 1})
+    return events
+
+
+def save_profile(profile: dict, path: Path = PROFILE_PATH) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(".tmp")
+    temp.write_text(json.dumps(profile, indent=2) + "\n")
+    temp.replace(path)
+
+
+def emit(message: dict) -> None:
+    print(json.dumps(message), flush=True)
+
+
+def watch_device(device: str, backend: str = "kernel",
+                 root: Path = SYSFS_INPUT, usb_root: Path = SYSFS_USB) -> None:
+    """Reads until the node goes away or another backend owns the tablet;
+    returns so the caller searches again. The OTD daemon keeps its virtual
+    nodes without the tablet, so a USB unplug never reaches the descriptor
+    and the backend is re-detected on every pass instead."""
+    fd = os.open(device, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        emit({"ok": True, "event": "connected", "device": device,
+              "firmware": read_firmware(device, root), "backend": backend})
+        while True:
+            if detect_backend(root, usb_root) != backend:
+                return
+            if not select.select([fd], [], [], 1.0)[0]:
+                continue
+            try:
+                data = os.read(fd, EVENT.size * 64)
+            except BlockingIOError:
+                continue
+            if not data:
+                return
+            for message in decode(data):
+                emit({"ok": True, **message})
+    except OSError as error:
+        if error.errno not in (errno.ENODEV, errno.EIO, errno.ENOENT):
+            raise
+    finally:
+        os.close(fd)
+
+
+def watch_step(input_root: Path = SYSFS_INPUT, usb_root: Path = SYSFS_USB) -> Optional[dict]:
+    """One pass of the watch loop: the message to emit, or None after a pad
+    node was watched until it went away."""
+    backend = detect_backend(input_root, usb_root)
+    if backend in ("kernel", "otd"):
+        find = find_device if backend == "kernel" else find_otd_pad
+        device = find(input_root)
+        if device is not None:
+            try:
+                watch_device(device, backend, input_root, usb_root)
+                return None
+            except PermissionError:
+                # sysfs stays readable without the udev rule.
+                message = {"ok": False, "error": "access-denied", "backend": backend}
+                firmware = read_firmware(device, input_root)
+                if firmware:
+                    message["firmware"] = firmware
+                return message
+            except FileNotFoundError:
+                pass
+    if backend == "otd":
+        # The virtual pad shows up once the plugin's bindings are applied;
+        # the backend is connected either way.
+        return {"ok": True, "event": "connected", "backend": "otd"}
+    return {"ok": False, "error": backend if backend != "kernel" else "missing"}
+
+
+def watch() -> int:
+    last = None
+    while True:
+        message = watch_step()
+        if message is None:
+            last = None
+            continue
+        if message != last:
+            emit(message)
+            last = message
+        time.sleep(RETRY_SECONDS)
+
+
+def main(argv: list) -> int:
+    if argv[1:] == ["watch"]:
+        try:
+            return watch()
+        except KeyboardInterrupt:
+            return 0
+    if len(argv) == 3 and argv[1] == "save":
+        try:
+            profile = json.loads(argv[2])
+        except ValueError:
+            profile = None
+        if not isinstance(profile, dict):
+            emit({"ok": False, "error": "invalid"})
+            return 1
+        save_profile(profile)
+        emit({"ok": True})
+        return 0
+    if argv[1:] == ["otd-read"]:
+        try:
+            sys.stdout.write(otd_read())
+        except (OSError, subprocess.CalledProcessError):
+            print("otd savesettings failed", file=sys.stderr)
+            return 1
+        return 0
+    if len(argv) == 3 and argv[1] == "otd-apply":
+        try:
+            otd_apply(json.loads(argv[2]))
+        except ValueError:
+            print("otd-apply wants a JSON object", file=sys.stderr)
+            return 2
+        except (OSError, subprocess.CalledProcessError):
+            print("otd loadsettings/savesettings failed", file=sys.stderr)
+            return 1
+        print("ok")
+        return 0
+    print(__doc__.strip(), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
